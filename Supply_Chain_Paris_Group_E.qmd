@@ -1,0 +1,2074 @@
+---
+title: "Supply chain Paris"
+format: 
+  html:
+    embed-resources: true
+editor: visual
+---
+
+# Supply Chain and Network Design: Final Project
+
+## Parcel deliveries at La Poste in Paris
+
+In this project, we were asked to put ourselves in the shoes of a consulting team whose aim was to resolve a customer request concerning the implementation and optimization of a supply chain network.
+
+In order to achieve this, we used the various tools and techniques we had learned throughout the semester in the course to develop a solution adapted to the problem observed.
+
+***Libraries importation***
+
+First of all, we need to import the various packages required to carry out our data analyses.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+library(maps)
+library(mapdata)
+library(tidyverse)
+library(raster)
+library(ggplot2)
+library(rgdal)
+library(rgeos)
+library(ggarchery) 
+library(RColorBrewer)
+library(wesanderson)
+library(sf)
+library(reticulate)
+library(JuliaCall)
+library(readxl)
+#julia_setup(JULIA_HOME = "/Applications/Julia-1.8.5/bin") # MAC
+julia_setup() #WINDOWS
+
+
+write('PATH="${RTOOLS40_HOME}\\usr\\bin;${PATH}"', file = "~/.Renviron", append = TRUE)
+Sys.which("make")
+## "C:\\rtools40\\usr\\bin\\make.exe"
+
+
+```
+
+# 1. Observation of the initial situation of our problem in the Paris region
+
+## 1.1 Displaying Paris' map with IRIS regions
+
+To do this, we began by importing a shape file containing the Ilots Regroupés pour l'Information Statistique (IRIS) for Paris.
+
+We selected the data relating to the city and converted it to gps format.
+
+After transforming all this to obtain an interesting display (calculation in km2), we displayed the data obtained for each plot.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ library(sf)
+ paname=st_read("./LaPoste/Paris/IRIS-PARIS/iris.shp")
+  
+paris=subset(paname,paname$dep==75)
+paris_gps=st_transform(paris, crs = 4326)
+paris=as(paris_gps,"Spatial")
+paris$area_sqkm <- area(paris) / 1000000
+paris_df=paris@data
+
+  gg <- ggplot() + geom_polygon(data = as(paris_gps, "Spatial"), aes(x = long, y = lat, group = group), color = "#FFFFFF", size = 0.25)
+  gg + coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+```
+
+## 1.2 Parcel demand in Paris
+
+Let's import the demand data
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+pop_df=read.csv("./LaPoste/Paris/RECENSEMENT_IRIS_POPULATION.CSV",sep = ",")
+
+pop_paris_df <- subset(pop_df, grepl("^75", c_cainsee))
+#pop_paris_df <- pop_paris_df %>% rename(iris = c_cainsee)
+#pop_paris_df <- pop_paris_df %>% rename(code_iris = c_ir)
+paris@data=merge(paris@data,pop_paris_df[,c("c_ir","nb_pop")],by.x="code_iris",by.y="c_ir")
+```
+
+After importing and processing the data in a similar way to the surface areas, we merge the population data with the previously processed spatial data set for Paris, associating the population with each corresponding spatial zone. In the following code, we will display an estimate of the number of plots per zone in the city of Paris, based on demand data.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+#Computing nb parcel/inhabitant
+nb_parcel_per_inhabitant=470/67.5/300
+ paris@data$nb_parcel= paris@data$nb_pop*nb_parcel_per_inhabitant
+ shp_df <- broom::tidy(paris, region = "iris")
+ shp_df=merge(shp_df,paris@data[,c("iris","nb_parcel","area_sqkm")],by.x="id",by.y="iris")
+  gg <- ggplot() + geom_polygon(data = shp_df, aes(x = long, y = lat, group = group,fill=nb_parcel), color = "#FFFFFF", size = 0.25)
+  gg + coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+```
+
+# 2. Selection of potential warehouses locations in Paris
+
+## 2.1 Visualization
+
+The aim of the following code is to locate the center of each spatial zone of Paris and then to display certain points. The center of each zone is calculated by averaging the latitudes and longitudes, and it also calculates the average number of parcels per zone.
+
+Once this has been done, it chooses 20 points at random from among those we have found.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide',collapse=TRUE}
+ library(tidyverse)
+ center_iris_df=shp_df %>% group_by(id) %>% summarise(lon=mean(long),lat=mean(lat),nb_parcel=mean(nb_parcel))
+ center_iris_df=merge(center_iris_df,paris[,c("iris","area_sqkm")],by.x="id",by.y="iris")
+ #we pick 20 random location from the iris codes
+ l=ceiling(runif(20,min=1,max=nrow(center_iris_df)))
+ gg + coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")  + geom_point(data = center_iris_df[l,], aes(x=lon,y=lat),size=1, color="red") 
+```
+
+## 2.2 Optimization
+
+After a first visualization, we're now going to carry out a precise and usable optimization for the data we have thanks to Julia.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ 
+ customer_df=center_iris_df
+ warehouse_df=center_iris_df[l,] 
+ 
+ I=nrow(customer_df)
+ J=nrow(warehouse_df)
+
+ customer_df$i=1:I
+ warehouse_df$j=1:J
+ 
+m=pointDistance(warehouse_df[,c("lon","lat")],customer_df[,c("lon","lat")],lonlat=TRUE,allpairs=TRUE)
+# we convert to km
+m=m/1000
+#we add a detour coefficient in the city
+m=m*1.3
+
+#we can compute the cost of assigning zone i to warehouse j (we reason at the daily level)
+#Capacity of a bike
+Cap=60
+#hourly cost
+h=27 #euros per hour
+
+#speed
+lh_s=22 #line haul speed in km/h
+de_s=13 #delivery speed in km/h
+tps= 3/60 #4 minutes per stop
+
+customer_df$tour_length=sqrt(customer_df$nb_parcel*customer_df$area_sqkm)*1.9
+customer_df$nb_tours=ceiling(customer_df$nb_parcel/Cap)
+
+c=matrix(0,I,J)
+for(i in 1:I){
+  for(j in 1:J){
+      c[i,j]=(customer_df[i,"tour_length"]/de_s + customer_df[i,"nb_tours"]*2*m[j,i]/lh_s + customer_df[i,"nb_parcel"]*tps)*h
+      #c[i,j]=(customer_df[i,"nb_tours"]*2*m[j,i]/lh_s)*h
+      #c[i,j]=(ceiling(customer_df[i,"nb_tours"])*2*m[j,i]/lh_s)*h
+    }
+}
+    
+
+#fixed cost (per day)
+f= 190 # euro per day for a 200 m2 micro-hub
+
+warehouse_df$fixed_cost=f
+d=customer_df$nb_parcel
+
+julia_assign("c", c)
+julia_assign("d", d)
+julia_assign("f", warehouse_df$fixed_cost) 
+julia_assign("customer_df", customer_df)
+julia_assign("warehouse_df", warehouse_df)
+julia_assign("I", nrow(customer_df))
+julia_assign("J", nrow(warehouse_df))
+```
+
+We start by preparing the code for the optimization. First we need to define two sets of data: one for the customers (the centers in the zones of Paris) and the other for the potential warehouses (20 random locations among the centers).
+
+We then calculate the matrix of distances between each customer and each warehouse, taking into account a diversion factor to reflect traffic conditions in the city.
+
+We also take into account constraints linked to the delivery process, such as :
+
+the capacity of a bicycle, the hourly cost of running it, the delivery speed and the time spent at each stop.
+
+With this information, the code can calculate the length of the delivery round and the number of delivery rounds required for each customer, as well as the cost of assigning each customer to each warehouse.
+
+Finally, we define a fixed cost for each warehouse and assign all this data to the Julia environment for later use in the warehouse location model.
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using JuMP
+using Gurobi
+
+   II= [i for i in 1:I if (customer_df[i,:nb_parcel]!=0)];
+
+    mod1 = Model(Gurobi.Optimizer);
+    #m = Model(Clp.Optimizer)
+
+    # Declaring variables
+    @variable(mod1, x[1:I,1:J], Bin);
+    @variable(mod1, y[1:J], Bin);
+
+    # Setting the objective
+    @objective(mod1, Min, sum(c[i,j] * x[i,j] for i in 1:I for j in 1:J) + sum(f[j] * y[j] for j in 1:J));
+
+    #setting the constraints
+    @constraint(mod1, [i in 1:I, j in 1:J], x[i, j] <= y[j]);
+    @constraint(mod1, [i in II], sum(x[i, j] for j in 1:J) == 1);
+
+
+    # Solving the optimization problem
+    #print(mod)
+    optimize!(mod1);
+```
+
+Here above, we create a Julia model whose aim is to minimize the total cost, which is the sum of the costs of assigning all customers to warehouses plus the fixed costs of all warehouses.
+
+The model imposes two constraints: the first ensures that a customer can only be assigned to a warehouse if that warehouse is open; the second ensures that each customer is assigned to exactly one warehouse.
+
+Finally, we solve the optimization model thanks to the code below that extracts the optimal solution from the previous model and stock it in the initial data set.
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using DataFrames
+    #store solution
+warehouse_df.chosen=zeros(J);
+customer_df.warehouse=zeros(I);
+
+for j=1:J
+       if(JuMP.value(y[j])==1)
+          warehouse_df.chosen[j]=1;
+        end
+     end
+     for j=1:J
+        for i=1:I
+           if(JuMP.value(x[i,j])==1)
+             customer_df.warehouse[i]=j;
+           end
+        end
+     end
+```
+
+Finally, we return the optimal value of the optimization model, which is the minimum total cost of allocating customers to warehouses, taking into account allocation costs and the fixed costs of open warehouses.
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+
+"We can observe a cost of $(objective_value(mod1)), which is the minimum total cost of allocating customers to warehouses, taking into account allocation costs and the fixed costs of open warehouses."
+
+```
+
+## 2.3 Optimal micro-hubs location and assignments
+
+We're now going to visualize the best locations for our micro hubs and the resulting distribution based on our data.
+
+To do this, we'll start by retrieving the results obtained using the Julia environment and creating empty vectors to store the coordinates of the lines to be drawn.
+
+Next, the code will run through each warehouse selected in the optimal solution. For each warehouse, it retrieves its latitude and longitude, then selects all the customers assigned to it.
+
+Once all the data is in the vectors, we create a data frame to store it, in which each row contains the respective coordinates of the vectors and then display it.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+warehouse_df=julia_eval("warehouse_df") 
+customer_df=julia_eval("customer_df") 
+
+xend=vector() 
+yend=vector() 
+x=vector() 
+y=vector() 
+color=vector() 
+
+for(k in which(warehouse_df$chosen==1)){ 
+  #store lat and long of the corresponding warehouse
+  w_lat=subset(warehouse_df,warehouse_df$j==k)$lat
+  w_long=subset(warehouse_df,warehouse_df$j==k)$lon
+
+  #look at all customers assigned to this warehouse
+  df=subset(customer_df,warehouse==k) 
+ 
+  xend=append(xend,df$lon) 
+  yend=append(yend,df$lat) 
+
+  x=append(x,rep(w_long,nrow(df))) 
+  y=append(y,rep(w_lat,nrow(df))) 
+
+  color=append(color,rep(k,nrow(df))) 
+} 
+
+segment_data = data.frame( 
+    x = x, 
+    y = y, 
+    xend = xend,  
+    yend = yend, 
+    color=color 
+) 
+
+library(ggarchery) 
+
+gg+
+  geom_segment(data = segment_data, aes(x = x, y = y, xend = xend, yend = yend,group=NA,color=as.factor(color)),arrow = arrow(length = unit(0.3, "picas"))) +   theme(legend.position = "none") +
+    coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+```
+
+Finally, we create a map of Paris, showing how the city is divided between the different warehouses. This allows us to clearly visualize the optimal solution for the warehouse location analysis.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+library(RColorBrewer)
+library(wesanderson)
+
+n=sum(warehouse_df$chosen)
+colors=grDevices::colors()
+col=sample(colors, 24)
+my_colors <- c("#000000", col)
+
+shp_df=merge(shp_df,customer_df[,c("id","warehouse")],by="id")
+
+ggplot() + geom_polygon(data = shp_df, aes(x = long, y = lat, group = group,fill=factor(warehouse)), color = "#FFFFFF", size = 0.25) + coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on") + theme(legend.position = "none") + scale_fill_manual(values = my_colors)
+```
+
+### 2.3.1 Map with all the warehouses
+
+Before our next analysis, it is also interesting to add a visualization of the main warehouses of the following 3 subsidiaries, members of La Poste group: DPD, Colissimo & Chronopost.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+Entrepots <- read_excel("./LaPoste/Paris/Entrepots.xlsx")
+Entrepots <- as.data.frame(Entrepots)
+Demande <- read_excel("./LaPoste/Paris/Demande.xlsx")
+
+EntrepotsChrono <- filter(Entrepots, Filiere == "Chronopost")
+EntrepotsDPD <- filter(Entrepots, Filiere == "DPD")
+EntrepotsColi <- filter(Entrepots, Filiere == "Colisimmo")
+
+gg <- ggplot() + 
+  geom_polygon(data = as(paris_gps, "Spatial"), aes(x = long, y = lat, group = group), color = "#FFFFFF", size = 0.25)
+gg <- gg + 
+  coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on") +
+  geom_point(data = Entrepots, aes(x = Long, y = Lat, color = Filiere), size = 2)
+
+print(gg)
+
+#DPD
+#Obtain unique value
+unique_valueDPD <- as.numeric(Demande$`Dem. %`[2])
+
+#Multiply population by unique value and  affect to a new column
+pop_paris_df$demand_DPD <- pop_paris_df$nb_pop * unique_valueDPD
+
+#Colissimo
+#Obtain unique value
+unique_valueColissimo <- as.numeric(Demande$`Dem. %`[1])
+
+#Multiply population by unique value and  affect to a new column
+pop_paris_df$demand_Colissimo <- pop_paris_df$nb_pop * unique_valueColissimo
+
+#Chronopost
+#Obtain unique value
+unique_valueChronopost <- as.numeric(Demande$`Dem. %`[3])
+
+#Multiply population by unique value and  affect to a new column
+pop_paris_df$demand_Chronopost <- pop_paris_df$nb_pop * unique_valueChronopost
+
+```
+
+Above, we analyse the demand for delivery services in the various districts of Paris and show the locations of the warehouses of the three different subsidiaries of La Poste: Chronopost, DPD and Colissimo. This code gives us an initial estimate of the demand for delivery services for each branch in each district of the city.
+
+Before moving on to the analysis of each subsidiary, we will prepare the data for further analysis. We'll do this by calculating the centroids of each district of Paris, extracting the coordinates of these centroids, and then associating them with existing population data.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+#Centroids computations
+centroids <- st_centroid(paris_gps$geometry)
+
+#Coordinates extract & affectation
+coordinates <- st_coordinates(centroids)
+
+paris_gps$long <- coordinates[, 'X']
+paris_gps$lat <- coordinates[, 'Y']
+
+#Merging dataframes
+pop_paris_df <- merge(pop_paris_df, paris_gps[, c('code_iris', 'long', 'lat')], by.x = 'c_ir', by.y = 'code_iris')
+
+warehouseparis_df <- Entrepots
+customerparis_df <- pop_paris_df
+```
+
+# 3. Analysis of La Poste group's various business lines
+
+In this part of the report, as in the first, we will carry out a demand analysis for each of the Group's supply chains, and optimize the potential distribution network as far as possible.
+
+Before moving on to the development of our analysis, here is a general presentation of the assumptions we have considered for our optimization. These assumptions may vary according to the different companies and the optimization that is made. For deliveries with cargo bikes, the assumptions are as follows: Distance: Our optimization are based on distances as the crow flies from distribution centers to micro-hubs and from micro-hubs to demand parcels. So, after transforming the distances into kilometers, we added an extra coefficient of 1.3 times the number of kilometers as the crow flies to get closer to the reality of the routes. Cost: We also set rates for variable business costs. Firstly, a wage of 27.00 per hour for the delivery drivers. Secondly, a rental charge of €190 per day for a surface area of 200m2 for the micro-hubs we need. Capacity: We assumed that a bicycle distributor could carry a maximum of 60 parcels at a time. Speed: The speed of the various means of transport also had to be fixed. For the line haul we set an average speed of 22km/h. For delivery by bicycle, we set an average speed of 13km/h. To these speeds, which give us the total delivery time, we need to add a delivery time of 3 minutes per stop for the deliverymen when they bring the parcels in.
+
+For deliveries by van, the assumptions for costs and distances are the same as for deliveries by cargo bike. For other deliveries, the new assumptions are as follows: Capacity: We have assumed that a van distributor can carry a maximum of 120 parcels at a time. Speed: The average speed of the different means of transport is as follows. For line haul deliveries we have set an average speed of 25km/h. For the delivery speed of the vans, we have set an average speed of 11km/h. To these speeds, which give us the total delivery time, we need to add a delivery time of 5 minutes per stop for the delivery drivers when they bring the parcels in.
+
+## 3.1 DPD
+
+As with the part of the work contained in point 2, here we're going to visualize, optimize and display our results for the data, but this time for the DPD group.
+
+Afterwards, we will also optimize the supply of these micro-hubs by the company's main warehouses located outside the city.
+
+Finally, we will attempt to establish more ideal locations for these warehouses, in order to provide La Poste Group with potential ideas for improving its agencies network.
+
+### 3.1.1 Visualization
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+DPDWarehouse <- filter(Entrepots, Entrepots$Filiere == "DPD")
+
+gg <- ggplot() + 
+  geom_polygon(data = as(paris_gps, "Spatial"), aes(x = long, y = lat, group = group), color = "#FFFFFF", size = 0.25)
+gg <- gg + 
+  coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on") +
+  geom_point(data = DPDWarehouse, aes(x = Long, y = Lat, color = Filiere), size = 2)
+
+print(gg)
+ paris@data$nb_parcelDPD= pop_paris_df$demand_DPD
+ shp_dfDPD <- broom::tidy(paris, region = "iris")
+
+ shp_dfDPD=merge(shp_dfDPD,paris@data[,c("iris","nb_parcelDPD","area_sqkm")],by.x="id",by.y="iris")
+
+  gg <- ggplot() + geom_polygon(data = shp_dfDPD, aes(x = long, y = lat, group = group,fill=nb_parcelDPD), color = "#FFFFFF", size = 0.25)
+  gg + coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+   center_iris_dfdpd=shp_dfDPD %>% group_by(id) %>% summarise(lon=mean(long),lat=mean(lat),nb_parcelDPD=mean(nb_parcelDPD))
+ center_iris_dfdpd=merge(center_iris_dfdpd,paris[,c("iris","area_sqkm")],by.x="id",by.y="iris")
+ #we pick 20 random location from the iris codes
+ l=ceiling(runif(20,min=1,max=nrow(center_iris_dfdpd)))
+ gg + coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")  + geom_point(data = center_iris_dfdpd[l,], aes(x=lon,y=lat),size=1, color="red") 
+```
+
+### 3.1.2 Optimization
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ 
+ customer_df=center_iris_dfdpd
+ warehouse_df=center_iris_dfdpd[l,] 
+ 
+ I=nrow(customer_df)
+ J=nrow(warehouse_df)
+
+ customer_df$i=1:I
+ warehouse_df$j=1:J
+ 
+m=pointDistance(warehouse_df[,c("lon","lat")],customer_df[,c("lon","lat")],lonlat=TRUE,allpairs=TRUE)
+# we convert to km
+m=m/1000
+#we add a detour coefficient in the city
+m=m*1.3
+
+#we can compute the cost of assigning zone i to warehouse j (we reason at the daily level)
+#Capacity of a bike
+Cap=60
+#hourly cost
+h=27 #euros per hour
+
+#speed
+lh_s=22 #line haul speed in km/h
+de_s=13 #delivery speed in km/h
+tps= 3/60 #3 minutes per stop
+
+customer_df$tour_length=sqrt(customer_df$nb_parcelDPD*customer_df$area_sqkm)*1.9
+customer_df$nb_tours=ceiling(customer_df$nb_parcelDPD/Cap)
+
+c=matrix(0,I,J)
+for(i in 1:I){
+  for(j in 1:J){
+      c[i,j]=(customer_df[i,"tour_length"]/de_s + customer_df[i,"nb_tours"]*2*m[j,i]/lh_s + customer_df[i,"nb_parcelDPD"]*tps)*h
+      #c[i,j]=(customer_df[i,"nb_tours"]*2*m[j,i]/lh_s)*h
+      #c[i,j]=(ceiling(customer_df[i,"nb_tours"])*2*m[j,i]/lh_s)*h
+    }
+}
+    
+
+#fixed cost (per day)
+f= 190 # euro per day for a 200 m2 micro-hub
+
+warehouse_df$fixed_cost=f
+d=customer_df$nb_parcelDPD
+
+julia_assign("c", c)
+julia_assign("d", d)
+julia_assign("f", warehouse_df$fixed_cost) 
+julia_assign("customer_df", customer_df)
+julia_assign("warehouse_df", warehouse_df)
+julia_assign("I", nrow(customer_df))
+julia_assign("J", nrow(warehouse_df))
+
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using JuMP
+using Gurobi
+
+   II= [i for i in 1:I if (customer_df[i,:nb_parcelDPD]!=0)];
+
+    mod2 = Model(Gurobi.Optimizer);
+    #m = Model(Clp.Optimizer)
+
+    # Declaring variables
+    @variable(mod2, x[1:I,1:J], Bin);
+    @variable(mod2, y[1:J], Bin);
+
+    # Setting the objective
+    @objective(mod2, Min, sum(c[i,j] * x[i,j] for i in 1:I for j in 1:J) + sum(f[j] * y[j] for j in 1:J));
+
+    #setting the constraints
+    @constraint(mod2, [i in 1:I, j in 1:J], x[i, j] <= y[j]);
+    @constraint(mod2, [i in II], sum(x[i, j] for j in 1:J) == 1);
+
+
+    # Solving the optimization problem
+    #print(mod)
+    optimize!(mod2);
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using DataFrames
+
+       
+    #store solution
+warehouse_df.chosen=zeros(J);
+customer_df.warehouse=zeros(I);
+
+for j=1:J
+       if(JuMP.value(y[j])==1)
+          warehouse_df.chosen[j]=1;
+        end
+     end
+     for j=1:J
+        for i=1:I
+           if(JuMP.value(x[i,j])==1)
+             customer_df.warehouse[i]=j;
+           end
+        end
+     end
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+
+"To connect serve their clients to their hub in Paris the DPD branch has a cost of $(objective_value(mod2))."
+```
+
+### 3.1.3 Optimal micro-hubs location and assignments
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+warehouse_df=julia_eval("warehouse_df") 
+customer_df=julia_eval("customer_df") 
+
+xend=vector() 
+yend=vector() 
+x=vector() 
+y=vector() 
+color=vector() 
+
+for(k in which(warehouse_df$chosen==1)){ 
+  #store lat and long of the corresponding warehouse
+  w_lat=subset(warehouse_df,warehouse_df$j==k)$lat
+  w_long=subset(warehouse_df,warehouse_df$j==k)$lon
+
+  #look at all customers assigned to this warehouse
+  df=subset(customer_df,warehouse==k) 
+ 
+  xend=append(xend,df$lon) 
+  yend=append(yend,df$lat) 
+
+  x=append(x,rep(w_long,nrow(df))) 
+  y=append(y,rep(w_lat,nrow(df))) 
+
+  color=append(color,rep(k,nrow(df))) 
+} 
+
+segment_data = data.frame( 
+    x = x, 
+    y = y, 
+    xend = xend,  
+    yend = yend, 
+    color=color 
+) 
+
+library(ggarchery) 
+
+gg+
+  geom_segment(data = segment_data, aes(x = x, y = y, xend = xend, yend = yend,group=NA,color=as.factor(color)),arrow = arrow(length = unit(0.3, "picas"))) +   theme(legend.position = "none") +
+    coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+```
+
+### 3.1.4 Optimal warehouses to micro-hubs
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ 
+ customer_df=center_iris_dfdpd[l,]
+ warehouse_df=EntrepotsDPD
+ 
+ I=nrow(customer_df)
+ J=nrow(warehouse_df)
+
+ customer_df$i=1:I
+ warehouse_df$j=1:J
+ 
+m=pointDistance(warehouse_df[,c("Long","Lat")],customer_df[,c("lon","lat")],lonlat=TRUE,allpairs=TRUE)
+# we convert to km
+m=m/1000
+#we add a detour coefficient in the city
+m=m*1.3
+
+#we can compute the cost of assigning zone i to warehouse j (we reason at the daily level)
+#Capacity of a bike
+Cap=120
+#hourly cost
+h=27 #euros per hour
+
+#speed
+lh_s=25 #line haul speed in km/h
+de_s=11 #delivery speed in km/h
+tps= 5/60 #5 minutes per stop
+
+customer_df$tour_length=sqrt(customer_df$nb_parcelDPD*customer_df$area_sqkm)*1.9
+customer_df$nb_tours=ceiling(customer_df$nb_parcelDPD/Cap)
+
+c=matrix(0,I)
+for(i in 1:I){
+    c[i]=(customer_df[i,"tour_length"]/de_s + customer_df[i,"nb_tours"]*2*m[i]/lh_s + customer_df[i,"nb_parcelDPD"]*tps)*h
+      #c[i,j]=(customer_df[i,"nb_tours"]*2*m[j,i]/lh_s)*h
+      #c[i,j]=(ceiling(customer_df[i,"nb_tours"])*2*m[j,i]/lh_s)*h
+    }
+
+d=customer_df$nb_parcelDPD
+
+julia_assign("c", c)
+julia_assign("d", d)
+julia_assign("customer_df", customer_df)
+julia_assign("warehouse_df", warehouse_df)
+julia_assign("I", nrow(customer_df))
+julia_assign("J", nrow(warehouse_df))
+
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using JuMP
+using Gurobi
+
+   II= [i for i in 1:I if (customer_df[i,:nb_parcelDPD]!=0)];
+
+    mod3 = Model(Gurobi.Optimizer);
+    #m = Model(Clp.Optimizer)
+
+    # Declaring variables
+    @variable(mod3, x[1:I,1:J], Bin);
+    @variable(mod3, y[1:J], Bin);
+
+    # Setting the objective
+    @objective(mod3, Min, sum(c[i,j] * x[i,j] for i in 1:I for j in 1:J));
+
+    #setting the constraints
+    @constraint(mod3, [i in 1:I, j in 1:J], x[i, j] <= y[j]);
+    @constraint(mod3, [i in II], sum(x[i, j] for j in 1:J) == 1);
+
+
+    # Solving the optimization problem
+    #print(mod)
+    optimize!(mod3);
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using DataFrames
+
+       
+    #store solution
+warehouse_df.chosen=zeros(J);
+customer_df.warehouse=zeros(I);
+
+for j=1:J
+       if(JuMP.value(y[j])==1)
+          warehouse_df.chosen[j]=1;
+        end
+     end
+     for j=1:J
+        for i=1:I
+           if(JuMP.value(x[i,j])==1)
+             customer_df.warehouse[i]=j;
+           end
+        end
+     end
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+"To connect their warehouses to their hubs in Paris, the DPD branch has a cost of $(objective_value(mod3))."
+```
+
+
+### 3.1.5 Optimal warehouses location and assignments
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+warehouse_df=julia_eval("warehouse_df") 
+customer_df=julia_eval("customer_df") 
+
+xend=vector() 
+yend=vector() 
+x=vector() 
+y=vector() 
+color=vector() 
+
+for(k in which(warehouse_df$chosen==1)){ 
+  #store lat and long of the corresponding warehouse
+  w_lat=subset(warehouse_df,warehouse_df$j==k)$Lat
+  w_long=subset(warehouse_df,warehouse_df$j==k)$Long
+
+  #look at all customers assigned to this warehouse
+  df=subset(customer_df,warehouse==k) 
+ 
+  xend=append(xend,df$lon) 
+  yend=append(yend,df$lat) 
+
+  x=append(x,rep(w_long,nrow(df))) 
+  y=append(y,rep(w_lat,nrow(df))) 
+
+  color=append(color,rep(k,nrow(df))) 
+} 
+
+segment_data = data.frame( 
+    x = x, 
+    y = y, 
+    xend = xend,  
+    yend = yend, 
+    color=color 
+) 
+
+library(ggarchery) 
+
+gg+
+  geom_segment(data = segment_data, aes(x = x, y = y, xend = xend, yend = yend,group=NA,color=as.factor(color)),arrow = arrow(length = unit(0.3, "picas"))) +   theme(legend.position = "none") +
+    coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+```
+
+### 3.1.6 Conclusion
+
+```{julia,echo=FALSE,message=FALSE,warning=FALSE,results='hide'}
+total_cost1 = objective_value(mod2) + objective_value(mod3)
+
+```
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+
+
+"We see that the total optimized cost for the DPD branch is $(objective_value(mod2)) + $(objective_value(mod3)) = $(total_cost1)."
+```
+
+
+## 3.2 Chronopost
+
+### 3.2.1 Visualization
+
+We're going to do the same here for the analysis concerning the Chronopost branch.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ paris@data$nb_parcelChronopost= pop_paris_df$demand_Chronopost
+
+
+
+ shp_dfChronopost <- broom::tidy(paris, region = "iris")
+
+ shp_dfChronopost=merge(shp_dfChronopost,paris@data[,c("iris","nb_parcelChronopost","area_sqkm")],by.x="id",by.y="iris")
+
+  gg <- ggplot() + geom_polygon(data = shp_dfChronopost, aes(x = long, y = lat, group = group,fill=nb_parcelChronopost), color = "#FFFFFF", size = 0.25)
+  gg + coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+  
+  
+  center_iris_dfchrono=shp_dfChronopost %>% group_by(id) %>% summarise(lon=mean(long),lat=mean(lat),nb_parcelChronopost=mean(nb_parcelChronopost))
+ center_iris_dfchrono=merge(center_iris_dfchrono,paris[,c("iris","area_sqkm")],by.x="id",by.y="iris")
+ #we pick 20 random location from the iris codes
+ l=ceiling(runif(20,min=1,max=nrow(center_iris_dfchrono)))
+ gg + coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")  + geom_point(data = center_iris_dfchrono[l,], aes(x=lon,y=lat),size=1, color="red") 
+```
+
+### 3.2.2 Optimization
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ 
+ customer_df=center_iris_dfchrono
+ warehouse_df=center_iris_dfchrono[l,] 
+ 
+ I=nrow(customer_df)
+ J=nrow(warehouse_df)
+
+ customer_df$i=1:I
+ warehouse_df$j=1:J
+ 
+m=pointDistance(warehouse_df[,c("lon","lat")],customer_df[,c("lon","lat")],lonlat=TRUE,allpairs=TRUE)
+# we convert to km
+m=m/1000
+#we add a detour coefficient in the city
+m=m*1.3
+
+#we can compute the cost of assigning zone i to warehouse j (we reason at the daily level)
+#Capacity of a bike
+Cap=60
+#hourly cost
+h=27 #euros per hour
+
+#speed
+lh_s=22 #line haul speed in km/h
+de_s=13 #delivery speed in km/h
+tps= 3/60 #3 minutes per stop
+
+customer_df$tour_length=sqrt(customer_df$nb_parcelChronopost*customer_df$area_sqkm)*1.9
+customer_df$nb_tours=ceiling(customer_df$nb_parcelChronopost/Cap)
+
+c=matrix(0,I,J)
+for(i in 1:I){
+  for(j in 1:J){
+      c[i,j]=(customer_df[i,"tour_length"]/de_s + customer_df[i,"nb_tours"]*2*m[j,i]/lh_s + customer_df[i,"nb_parcelChronopost"]*tps)*h
+      #c[i,j]=(customer_df[i,"nb_tours"]*2*m[j,i]/lh_s)*h
+      #c[i,j]=(ceiling(customer_df[i,"nb_tours"])*2*m[j,i]/lh_s)*h
+    }
+}
+    
+
+#fixed cost (per day)
+f= 190 # euro per day for a 200 m2 micro-hub
+
+warehouse_df$fixed_cost=f
+d=customer_df$nb_parcelChronopost
+
+julia_assign("c", c)
+julia_assign("d", d)
+julia_assign("f", warehouse_df$fixed_cost) 
+julia_assign("customer_df", customer_df)
+julia_assign("warehouse_df", warehouse_df)
+julia_assign("I", nrow(customer_df))
+julia_assign("J", nrow(warehouse_df))
+
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using JuMP
+using Gurobi
+
+   II= [i for i in 1:I if (customer_df[i,:nb_parcelChronopost]!=0)];
+
+    mod4 = Model(Gurobi.Optimizer);
+    #m = Model(Clp.Optimizer)
+
+    # Declaring variables
+    @variable(mod4, x[1:I,1:J], Bin);
+    @variable(mod4, y[1:J], Bin);
+
+    # Setting the objective
+    @objective(mod4, Min, sum(c[i,j] * x[i,j] for i in 1:I for j in 1:J) + sum(f[j] * y[j] for j in 1:J));
+
+    #setting the constraints
+    @constraint(mod4, [i in 1:I, j in 1:J], x[i, j] <= y[j]);
+    @constraint(mod4, [i in II], sum(x[i, j] for j in 1:J) == 1);
+
+
+    # Solving the optimization problem
+    #print(mod)
+    optimize!(mod4);
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using DataFrames
+
+       
+    #store solution
+warehouse_df.chosen=zeros(J);
+customer_df.warehouse=zeros(I);
+
+for j=1:J
+       if(JuMP.value(y[j])==1)
+          warehouse_df.chosen[j]=1;
+        end
+     end
+     for j=1:J
+        for i=1:I
+           if(JuMP.value(x[i,j])==1)
+             customer_df.warehouse[i]=j;
+           end
+        end
+     end
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+"To connect serve their clients to their hub in Paris the Chronopost branch has a cost of $(objective_value(mod4))."
+```
+
+
+### 3.2.3 Optimal micro-hubs location and assignments
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+warehouse_df=julia_eval("warehouse_df") 
+customer_df=julia_eval("customer_df") 
+
+xend=vector() 
+yend=vector() 
+x=vector() 
+y=vector() 
+color=vector() 
+
+for(k in which(warehouse_df$chosen==1)){ 
+  #store lat and long of the corresponding warehouse
+  w_lat=subset(warehouse_df,warehouse_df$j==k)$lat
+  w_long=subset(warehouse_df,warehouse_df$j==k)$lon
+
+  #look at all customers assigned to this warehouse
+  df=subset(customer_df,warehouse==k) 
+ 
+  xend=append(xend,df$lon) 
+  yend=append(yend,df$lat) 
+
+  x=append(x,rep(w_long,nrow(df))) 
+  y=append(y,rep(w_lat,nrow(df))) 
+
+  color=append(color,rep(k,nrow(df))) 
+} 
+
+segment_data = data.frame( 
+    x = x, 
+    y = y, 
+    xend = xend,  
+    yend = yend, 
+    color=color 
+) 
+
+library(ggarchery) 
+
+gg+
+  geom_segment(data = segment_data, aes(x = x, y = y, xend = xend, yend = yend,group=NA,color=as.factor(color)),arrow = arrow(length = unit(0.3, "picas"))) +   theme(legend.position = "none") +
+    coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+```
+
+### 3.2.4 Optimal delivery between warehouses & micro-hubs
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ 
+ customer_df=center_iris_dfchrono[l,]
+ warehouse_df=EntrepotsChrono
+ 
+ I=nrow(customer_df)
+ J=nrow(warehouse_df)
+
+ customer_df$i=1:I
+ warehouse_df$j=1:J
+ 
+m=pointDistance(warehouse_df[,c("Long","Lat")],customer_df[,c("lon","lat")],lonlat=TRUE,allpairs=TRUE)
+# we convert to km
+m=m/1000
+#we add a detour coefficient in the city
+m=m*1.3
+
+#we can compute the cost of assigning zone i to warehouse j (we reason at the daily level)
+#Capacity of a bike
+Cap=120
+#hourly cost
+h=27 #euros per hour
+
+#speed
+lh_s=25 #line haul speed in km/h
+de_s=11 #delivery speed in km/h
+tps= 5/60 #4 minutes per stop
+
+customer_df$tour_length=sqrt(customer_df$nb_parcelChronopost*customer_df$area_sqkm)*1.9
+customer_df$nb_tours=ceiling(customer_df$nb_parcelChronopost/Cap)
+
+c=matrix(0,I,J)
+for(i in 1:I){
+  for(j in 1:J){
+      c[i,j]=(customer_df[i,"tour_length"]/de_s + customer_df[i,"nb_tours"]*2*m[j,i]/lh_s + customer_df[i,"nb_parcelChronopost"]*tps)*h
+      #c[i,j]=(customer_df[i,"nb_tours"]*2*m[j,i]/lh_s)*h
+      #c[i,j]=(ceiling(customer_df[i,"nb_tours"])*2*m[j,i]/lh_s)*h
+    }
+}
+    
+
+
+
+d=customer_df$nb_parcelChronopost
+
+julia_assign("c", c)
+julia_assign("d", d)
+julia_assign("customer_df", customer_df)
+julia_assign("warehouse_df", warehouse_df)
+julia_assign("I", nrow(customer_df))
+julia_assign("J", nrow(warehouse_df))
+
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using JuMP
+using Gurobi
+
+   II= [i for i in 1:I if (customer_df[i,:nb_parcelChronopost]!=0)];
+
+    mod5 = Model(Gurobi.Optimizer);
+    #m = Model(Clp.Optimizer)
+
+    # Declaring variables
+    @variable(mod5, x[1:I,1:J], Bin);
+    @variable(mod5, y[1:J], Bin);
+
+    # Setting the objective
+    @objective(mod5, Min, sum(c[i,j] * x[i,j] for i in 1:I for j in 1:J));
+
+    #setting the constraints
+    @constraint(mod5, [i in 1:I, j in 1:J], x[i, j] <= y[j]);
+    @constraint(mod5, [i in II], sum(x[i, j] for j in 1:J) == 1);
+
+
+    # Solving the optimization problem
+    #print(mod)
+    optimize!(mod5);
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using DataFrames
+
+       
+    #store solution
+warehouse_df.chosen=zeros(J);
+customer_df.warehouse=zeros(I);
+
+for j=1:J
+       if(JuMP.value(y[j])==1)
+          warehouse_df.chosen[j]=1;
+        end
+     end
+     for j=1:J
+        for i=1:I
+           if(JuMP.value(x[i,j])==1)
+             customer_df.warehouse[i]=j;
+           end
+        end
+     end
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+
+"To connect their warehouses to their hubs in Paris, the Chronopost branch has a cost of $(objective_value(mod5))."
+
+```
+
+### 3.2.5 Optimal warehouses location and assignments
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+warehouse_df=julia_eval("warehouse_df") 
+customer_df=julia_eval("customer_df") 
+
+xend=vector() 
+yend=vector() 
+x=vector() 
+y=vector() 
+color=vector() 
+
+for(k in which(warehouse_df$chosen==1)){ 
+  #store lat and long of the corresponding warehouse
+  w_lat=subset(warehouse_df,warehouse_df$j==k)$Lat
+  w_long=subset(warehouse_df,warehouse_df$j==k)$Long
+
+  #look at all customers assigned to this warehouse
+  df=subset(customer_df,warehouse==k) 
+ 
+  xend=append(xend,df$lon) 
+  yend=append(yend,df$lat) 
+
+  x=append(x,rep(w_long,nrow(df))) 
+  y=append(y,rep(w_lat,nrow(df))) 
+
+  color=append(color,rep(k,nrow(df))) 
+} 
+
+segment_data = data.frame( 
+    x = x, 
+    y = y, 
+    xend = xend,  
+    yend = yend, 
+    color=color 
+) 
+
+library(ggarchery) 
+
+gg+
+  geom_segment(data = segment_data, aes(x = x, y = y, xend = xend, yend = yend,group=NA,color=as.factor(color)),arrow = arrow(length = unit(0.3, "picas"))) +   theme(legend.position = "none") +
+    coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+```
+
+### 3.2.6 Conclusion
+
+```{julia,echo=FALSE,message=FALSE,warning=FALSE,results='hide'}
+total_cost2 = objective_value(mod4) + objective_value(mod5)
+
+```
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+
+
+"We see that the total optimized cost for the Chronopost branch is $(objective_value(mod4)) + $(objective_value(mod5)) = $(total_cost2)."
+```
+
+
+## 3.3 Colissimo
+
+### 3.3.1 Visualization
+
+We're going to do the same here for the analysis concerning the Colissimo branch.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ paris@data$nb_parcelColissimo= pop_paris_df$demand_Colissimo
+
+
+
+ shp_dfColissimo <- broom::tidy(paris, region = "iris")
+
+ shp_dfColissimo=merge(shp_dfColissimo,paris@data[,c("iris","nb_parcelColissimo","area_sqkm")],by.x="id",by.y="iris")
+ 
+  shp_dfChronopost=merge(shp_dfChronopost,paris@data[,c("iris","nb_parcelChronopost","area_sqkm")],by.x="id",by.y="iris")
+
+  gg <- ggplot() + geom_polygon(data = shp_dfColissimo, aes(x = long, y = lat, group = group,fill=nb_parcelColissimo), color = "#FFFFFF", size = 0.25)
+  gg + coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+  
+  center_iris_dfcoli=shp_dfColissimo %>% group_by(id) %>% summarise(lon=mean(long),lat=mean(lat),nb_parcelColissimo=mean(nb_parcelColissimo))
+ center_iris_dfcoli=merge(center_iris_dfcoli,paris[,c("iris","area_sqkm")],by.x="id",by.y="iris")
+ #we pick 20 random location from the iris codes
+ l=ceiling(runif(20,min=1,max=nrow(center_iris_dfcoli)))
+ gg + coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")  + geom_point(data = center_iris_dfcoli[l,], aes(x=lon,y=lat),size=1, color="red") 
+```
+
+### 3.3.2 Optimization
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ 
+ customer_df=center_iris_dfcoli
+ warehouse_df=center_iris_dfcoli[l,] 
+ 
+ I=nrow(customer_df)
+ J=nrow(warehouse_df)
+
+ customer_df$i=1:I
+ warehouse_df$j=1:J
+ 
+m=pointDistance(warehouse_df[,c("lon","lat")],customer_df[,c("lon","lat")],lonlat=TRUE,allpairs=TRUE)
+# we convert to km
+m=m/1000
+#we add a detour coefficient in the city
+m=m*1.3
+
+#we can compute the cost of assigning zone i to warehouse j (we reason at the daily level)
+#Capacity of a bike
+Cap=60
+#hourly cost
+h=27 #euros per hour
+
+#speed
+lh_s=22 #line haul speed in km/h
+de_s=13 #delivery speed in km/h
+tps= 3/60 #3 minutes per stop
+
+customer_df$tour_length=sqrt(customer_df$nb_parcelColissimo*customer_df$area_sqkm)*1.9
+customer_df$nb_tours=ceiling(customer_df$nb_parcelColissimo/Cap)
+
+c=matrix(0,I,J)
+for(i in 1:I){
+  for(j in 1:J){
+      c[i,j]=(customer_df[i,"tour_length"]/de_s + customer_df[i,"nb_tours"]*2*m[j,i]/lh_s + customer_df[i,"nb_parcelColissimo"]*tps)*h
+      #c[i,j]=(customer_df[i,"nb_tours"]*2*m[j,i]/lh_s)*h
+      #c[i,j]=(ceiling(customer_df[i,"nb_tours"])*2*m[j,i]/lh_s)*h
+    }
+}
+    
+
+#fixed cost (per day)
+f= 190 # euro per day for a 200 m2 micro-hub
+
+warehouse_df$fixed_cost=f
+d=customer_df$nb_parcelColissimo
+
+julia_assign("c", c)
+julia_assign("d", d)
+julia_assign("f", warehouse_df$fixed_cost) 
+julia_assign("customer_df", customer_df)
+julia_assign("warehouse_df", warehouse_df)
+julia_assign("I", nrow(customer_df))
+julia_assign("J", nrow(warehouse_df))
+
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using JuMP
+using Gurobi
+
+   II= [i for i in 1:I if (customer_df[i,:nb_parcelColissimo]!=0)];
+
+    mod6 = Model(Gurobi.Optimizer);
+    #m = Model(Clp.Optimizer)
+
+    # Declaring variables
+    @variable(mod6, x[1:I,1:J], Bin);
+    @variable(mod6, y[1:J], Bin);
+
+    # Setting the objective
+    @objective(mod6, Min, sum(c[i,j] * x[i,j] for i in 1:I for j in 1:J) + sum(f[j] * y[j] for j in 1:J));
+
+    #setting the constraints
+    @constraint(mod6, [i in 1:I, j in 1:J], x[i, j] <= y[j]);
+    @constraint(mod6, [i in II], sum(x[i, j] for j in 1:J) == 1);
+
+
+    # Solving the optimization problem
+    #print(mod)
+    optimize!(mod6);
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using DataFrames
+
+       
+    #store solution
+warehouse_df.chosen=zeros(J);
+customer_df.warehouse=zeros(I);
+
+for j=1:J
+       if(JuMP.value(y[j])==1)
+          warehouse_df.chosen[j]=1;
+        end
+     end
+     for j=1:J
+        for i=1:I
+           if(JuMP.value(x[i,j])==1)
+             customer_df.warehouse[i]=j;
+           end
+        end
+     end
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+"To connect serve their clients to their hub in Paris the Colissimo branch has a cost of $(objective_value(mod6))."
+```
+
+### 3.3.3 Optimal micro-hubs location and assignments
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+warehouse_df=julia_eval("warehouse_df") 
+customer_df=julia_eval("customer_df") 
+
+xend=vector() 
+yend=vector() 
+x=vector() 
+y=vector() 
+color=vector() 
+
+for(k in which(warehouse_df$chosen==1)){ 
+  #store lat and long of the corresponding warehouse
+  w_lat=subset(warehouse_df,warehouse_df$j==k)$lat
+  w_long=subset(warehouse_df,warehouse_df$j==k)$lon
+
+  #look at all customers assigned to this warehouse
+  df=subset(customer_df,warehouse==k) 
+ 
+  xend=append(xend,df$lon) 
+  yend=append(yend,df$lat) 
+
+  x=append(x,rep(w_long,nrow(df))) 
+  y=append(y,rep(w_lat,nrow(df))) 
+
+  color=append(color,rep(k,nrow(df))) 
+} 
+
+segment_data = data.frame( 
+    x = x, 
+    y = y, 
+    xend = xend,  
+    yend = yend, 
+    color=color 
+) 
+
+library(ggarchery) 
+
+gg+
+  geom_segment(data = segment_data, aes(x = x, y = y, xend = xend, yend = yend,group=NA,color=as.factor(color)),arrow = arrow(length = unit(0.3, "picas"))) +   theme(legend.position = "none") +
+    coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+```
+
+### 3.3.4 Optimal delivery between warehouses & micro-hubs
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ 
+ customer_df=center_iris_dfcoli[l,]
+ warehouse_df=EntrepotsColi
+ 
+ I=nrow(customer_df)
+ J=nrow(warehouse_df)
+
+ customer_df$i=1:I
+ warehouse_df$j=1:J
+ 
+m=pointDistance(warehouse_df[,c("Long","Lat")],customer_df[,c("lon","lat")],lonlat=TRUE,allpairs=TRUE)
+# we convert to km
+m=m/1000
+#we add a detour coefficient in the city
+m=m*1.3
+
+#we can compute the cost of assigning zone i to warehouse j (we reason at the daily level)
+#Capacity of a bike
+Cap=120
+#hourly cost
+h=27 #euros per hour
+
+#speed
+lh_s=25 #line haul speed in km/h
+de_s=11 #delivery speed in km/h
+tps= 5/60 #4 minutes per stop
+
+customer_df$tour_length=sqrt(customer_df$nb_parcelColissimo*customer_df$area_sqkm)*1.9
+customer_df$nb_tours=ceiling(customer_df$nb_parcelColissimo/Cap)
+
+c=matrix(0,I,J)
+for(i in 1:I){
+  for(j in 1:J){
+      c[i,j]=(customer_df[i,"tour_length"]/de_s + customer_df[i,"nb_tours"]*2*m[j,i]/lh_s + customer_df[i,"nb_parcelColissimo"]*tps)*h
+      #c[i,j]=(customer_df[i,"nb_tours"]*2*m[j,i]/lh_s)*h
+      #c[i,j]=(ceiling(customer_df[i,"nb_tours"])*2*m[j,i]/lh_s)*h
+    }
+}
+    
+
+
+
+d=customer_df$nb_parcelColissimo
+
+julia_assign("c", c)
+julia_assign("d", d)
+julia_assign("customer_df", customer_df)
+julia_assign("warehouse_df", warehouse_df)
+julia_assign("I", nrow(customer_df))
+julia_assign("J", nrow(warehouse_df))
+
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using JuMP
+using Gurobi
+
+   II= [i for i in 1:I if (customer_df[i,:nb_parcelColissimo]!=0)];
+
+    mod7 = Model(Gurobi.Optimizer);
+    #m = Model(Clp.Optimizer)
+
+    # Declaring variables
+    @variable(mod7, x[1:I,1:J], Bin);
+    @variable(mod7, y[1:J], Bin);
+
+    # Setting the objective
+    @objective(mod7, Min, sum(c[i,j] * x[i,j] for i in 1:I for j in 1:J));
+
+    #setting the constraints
+    @constraint(mod7, [i in 1:I, j in 1:J], x[i, j] <= y[j]);
+    @constraint(mod7, [i in II], sum(x[i, j] for j in 1:J) == 1);
+
+
+    # Solving the optimization problem
+    #print(mod)
+    optimize!(mod7);
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using DataFrames
+
+       
+    #store solution
+warehouse_df.chosen=zeros(J);
+customer_df.warehouse=zeros(I);
+
+for j=1:J
+       if(JuMP.value(y[j])==1)
+          warehouse_df.chosen[j]=1;
+        end
+     end
+     for j=1:J
+        for i=1:I
+           if(JuMP.value(x[i,j])==1)
+             customer_df.warehouse[i]=j;
+           end
+        end
+     end
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+"To connect their warehouses to their hubs in Paris, the Colissimo branch has a cost of $(objective_value(mod7))."
+```
+
+### 3.3.5 Optimal warehouses location and assignments
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+warehouse_df=julia_eval("warehouse_df") 
+customer_df=julia_eval("customer_df") 
+
+xend=vector() 
+yend=vector() 
+x=vector() 
+y=vector() 
+color=vector() 
+
+for(k in which(warehouse_df$chosen==1)){ 
+  #store lat and long of the corresponding warehouse
+  w_lat=subset(warehouse_df,warehouse_df$j==k)$Lat
+  w_long=subset(warehouse_df,warehouse_df$j==k)$Long
+
+  #look at all customers assigned to this warehouse
+  df=subset(customer_df,warehouse==k) 
+ 
+  xend=append(xend,df$lon) 
+  yend=append(yend,df$lat) 
+
+  x=append(x,rep(w_long,nrow(df))) 
+  y=append(y,rep(w_lat,nrow(df))) 
+
+  color=append(color,rep(k,nrow(df))) 
+} 
+
+segment_data = data.frame( 
+    x = x, 
+    y = y, 
+    xend = xend,  
+    yend = yend, 
+    color=color 
+) 
+
+library(ggarchery) 
+
+gg+
+  geom_segment(data = segment_data, aes(x = x, y = y, xend = xend, yend = yend,group=NA,color=as.factor(color)),arrow = arrow(length = unit(0.3, "picas"))) +   theme(legend.position = "none") +
+    coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+```
+
+### 3.3.6 Conclusion
+
+```{julia,echo=FALSE,message=FALSE,warning=FALSE,results='hide'}
+total_cost3 = objective_value(mod6) + objective_value(mod7)
+
+```
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+
+
+"We see that the total optimized cost for the Colissimo branch is $(objective_value(mod6)) + $(objective_value(mod7)) = $(total_cost3)."
+```
+
+## 3.4 Conclusion on La Poste group's various business lines
+
+```{julia,echo=FALSE,message=FALSE,warning=FALSE,results='hide'}
+total_cost4 = total_cost1 + total_cost2 + total_cost3
+```
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+
+
+"The DPD branch has a total cost of $(total_cost1). The Chronopost branch has a total cost of $(total_cost2). The Colissimo branch has a total cost of $(total_cost3). Together these three branches have a total cost of $(total_cost4)."
+```
+
+
+# 4. Potential innovation: Metro distribution
+
+Through this project, we were asked to add an innovative dimension to our analysis, by proposing, for example, the use of a new distribution method that would be faster and/or more sustainable.
+
+We felt that the city of Paris was particularly well suited to this thanks to its metro network, which is already very well developed and will be even more so in the coming year following its expansion in preparation for the Paris Olympics in 2024.
+
+This metro network would increase the number of pick-up points, reduce labor costs, improve environmental impact by transporting more parcels simultaneously, but also add real value for users, who will now be able to collect their parcels more easily from a pick-up point close to home.
+
+## 4.1 Metro assumptions
+
+Our analysis leads us to make new assumptions for the additional means of transport we have decided to use, the metro. The assumptions for this mode of transport are as follows:
+
+Capacity: The capacity of a metro train can vary depending on the model and configuration, but on average, a metro train can accommodate around 600 to 700 people. If we consider that a person occupies around 0.5 square meters, this means that a metro train has a surface area of around 300 to 350 square meters. If a parcel has an average size of 0.05 square meters (which is an estimate based on a parcel size of 40cm x 30cm x 30cm), then a metro train could theoretically hold around 6,000 to 7,000 parcels. However, this estimate does not take into account the practical constraints of loading and unloading parcels, or the need to leave space for passage.. Speed: The average speed of the metro is 25 km/h. This speed is used to calculate the time needed to transport the parcels, to which must be added the time needed to unload the metro, a forklift truck can move 50 parcels at a time, so a forklift could move 3,000 parcels an hour. So we decided to use 5 forklifts to empty the parcels in 30 minutes.
+
+## 4.2 Visualization
+
+So we start this analysis by cleaning up the data we've found on the metro, creating lines, determining whether stations are terminus or not, and finally separating terminus from classic stations. We finish by adding to this the map with demand, adding the city's metro lines that we've just determined.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+
+metro_france <- read.csv("./LaPoste/Paris/metro-france.csv",  sep = ";")
+metro_france <- as.data.frame(metro_france)
+
+metro_paris <- metro_france[grepl("^75", as.character(metro_france$Commune.code.Insee)), ]
+
+metro_ext <- subset(metro_france, ID.Line >= 13 & ID.Line <= 35)
+
+metro_ext <- metro_ext[grepl("^(75|78|91|92|93|94|95)", metro_ext$Commune.code.Insee), ]
+
+# Tri du data frame par colonne "Libelle.line"
+metro_ext <- metro_ext %>%
+  arrange(Libelle.Line)
+
+# Ajout d'une colonne "order" aux arrêts de métro
+metro_ext <- metro_ext %>%
+  group_by(Libelle.Line) %>%
+  mutate(order = row_number()) %>%
+  ungroup()
+
+# Tri du dataframe par ligne et ordre
+metro_ext <- metro_ext %>% arrange(Libelle.Line, order)
+
+# Ajout des colonnes pour la station suivante dans chaque sens
+metro_ext <- metro_ext %>% 
+  group_by(Libelle.Line) %>% 
+  mutate(suivante_sens_1 = lead(Libelle.station),
+         suivante_sens_2 = lag(Libelle.station))
+
+# Ajouter une colonne "est_terminus" au DataFrame metro_ext
+metro_ext <- metro_ext %>% mutate(est_terminus = ifelse(is.na(suivante_sens_1) | is.na(suivante_sens_2), "Oui", "Non"))
+
+metro_terminus_df <- subset(metro_ext, est_terminus == "Oui")
+
+#metro_poste <- metro_ext[metro_ext$Libelle.Line %in% c(1, 4, 7, 9), ]
+
+#metro_terminus_df <- metro_poste %>%
+ # group_by(Libelle.Line) %>%
+  #slice(c(1, n())) %>%
+  #ungroup()
+
+
+metro_stops_df <- subset(metro_ext, Libelle.station %in% c("Gare du Nord", "Saint-Lazare", "Gare de Lyon", "Montparnasse-Bienvenue", "République", "Châtelet", "Gare d'Austerlitz") & Libelle.Line %in% c(1, 4, 7, 9))
+
+# Add all the demands together
+pop_paris_df$demand_total <- pop_paris_df$demand_DPD + pop_paris_df$demand_Colissimo + pop_paris_df$demand_Chronopost
+
+
+gg <- ggplot() +
+  geom_polygon(data = as(paris_gps, "Spatial"), aes(x = long, y = lat, group = group), color = "#FFFFFF", size = 0.25) +
+  geom_path(data = metro_ext, aes(x = Longitude, y = Latitude, group = Libelle.Line, color = Libelle.Line)) +
+  geom_point(data = metro_ext, aes(x = Longitude, y = Latitude, color = Libelle.Line), size = 0.5) +
+  coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+print(gg)
+```
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ paris@data$nb_parcelAll= pop_paris_df$demand_total
+ shp_dftotal <- broom::tidy(paris, region = "iris")
+
+ shp_dftotal=merge(shp_dftotal,paris@data[,c("iris","nb_parcelAll","area_sqkm")],by.x="id",by.y="iris")
+
+  gg <- ggplot() + geom_polygon(data = shp_dftotal, aes(x = long, y = lat, group = group,fill=nb_parcelAll), color = "#FFFFFF", size = 0.25)
+  gg + coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+  
+  center_iris_dfall=shp_dftotal %>% group_by(id) %>% summarise(lon=mean(long),lat=mean(lat),nb_parcelAll=mean(nb_parcelAll))
+ center_iris_dfall=merge(center_iris_dfall,paris[,c("iris","area_sqkm")],by.x="id",by.y="iris")
+```
+
+## 4.3 Optimization
+
+As with our previous analyses, we'll now try to optimize the composition of this distribution network, again with the aim of minimizing costs. We therefore begin this stage by creating the model and the constraints, and by setting out our working assumptions.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ 
+ customer1_df=center_iris_dfall
+ warehouse1_df=metro_ext
+ 
+ I=nrow(customer1_df)
+ J=nrow(warehouse1_df)
+
+ customer1_df$i=1:I
+ warehouse1_df$j=1:J
+ 
+m=pointDistance(warehouse1_df[,c("Longitude","Latitude")],customer1_df[,c("lon","lat")],lonlat=TRUE,allpairs=TRUE)
+# we convert to km
+m=m/1000
+#we add a detour coefficient in the city
+m=m*1.3
+
+#we can compute the cost of assigning zone i to warehouse j (we reason at the daily level)
+#Capacity of a bike
+Cap=60
+#hourly cost
+h=27 #euros per hour
+
+#speed
+lh_s=22 #line haul speed in km/h
+de_s=13 #delivery speed in km/h
+tps= 3/60 #3 minutes per stop
+
+customer1_df$tour_length=sqrt(customer1_df$nb_parcelAll*customer1_df$area_sqkm)*1.9
+customer1_df$nb_tours=ceiling(customer1_df$nb_parcelAll/Cap)
+
+c=matrix(0,I,J)
+for(i in 1:I){
+  for(j in 1:J){
+      c[i,j]=(customer1_df[i,"tour_length"]/de_s + customer1_df[i,"nb_tours"]*2*m[j,i]/lh_s + customer1_df[i,"nb_parcelAll"]*tps)*h
+      #c[i,j]=(customer1_df[i,"nb_tours"]*2*m[j,i]/lh_s)*h
+      #c[i,j]=(ceiling(customer1_df[i,"nb_tours"])*2*m[j,i]/lh_s)*h
+    }
+}
+    
+
+#fixed cost (per day)
+f= 190 # euro per day for a 200 m2 micro-hub
+
+warehouse1_df$fixed_cost=f
+d=customer1_df$nb_parcelAll
+
+julia_assign("c", c)
+julia_assign("d", d)
+julia_assign("f", warehouse1_df$fixed_cost) 
+julia_assign("customer1_df", customer1_df)
+julia_assign("warehouse1_df", warehouse1_df)
+julia_assign("I", nrow(customer1_df))
+julia_assign("J", nrow(warehouse1_df))
+
+```
+
+Having assigned all the values we need in the process, here we create the transition to Julia so that we can proceed with the optimization itself.
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using JuMP
+using Gurobi
+
+   II= [i for i in 1:I if (customer1_df[i,:nb_parcelAll]!=0)];
+
+    mod = Model(Gurobi.Optimizer);
+    #m = Model(Clp.Optimizer)
+
+    # Declaring variables
+    @variable(mod, x[1:I,1:J], Bin);
+    @variable(mod, y[1:J], Bin);
+
+    # Setting the objective
+    @objective(mod, Min, sum(c[i,j] * x[i,j] for i in 1:I for j in 1:J) + sum(f[j] * y[j] for j in 1:J));
+
+    #setting the constraints
+    @constraint(mod, [i in 1:I, j in 1:J], x[i, j] <= y[j]);
+    @constraint(mod, [i in II], sum(x[i, j] for j in 1:J) == 1);
+
+
+    # Solving the optimization problem
+    #print(mod)
+    optimize!(mod);
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using DataFrames
+
+       
+    #store solution
+warehouse1_df.chosen=zeros(J);
+customer1_df.warehouse=zeros(I);
+
+for j=1:J
+       if(JuMP.value(y[j])==1)
+          warehouse1_df.chosen[j]=1;
+        end
+     end
+     for j=1:J
+        for i=1:I
+           if(JuMP.value(x[i,j])==1)
+             customer1_df.warehouse[i]=j;
+           end
+        end
+     end
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+objective_value(mod)
+```
+
+We see that the cost of using the metro system to deliver clients is 1,090,296.51. Note that this cost represent the total cost to supply the demand of the three branches (DPD, Chronopost and Colissimo).
+
+### 4.3.1 Optimal micro-hubs location and assignment
+
+Here, we're going to retrieve data from warehouses and customers, and then plot segments linking each warehouse to its customers on a graph. The geographical coordinates of the warehouses and customers are used to determine the start and end points of the segments.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+warehouse1_df=julia_eval("warehouse1_df") 
+customer1_df=julia_eval("customer1_df") 
+
+xend=vector() 
+yend=vector() 
+x=vector() 
+y=vector() 
+color=vector() 
+
+for(k in which(warehouse1_df$chosen==1)){ 
+  #store lat and long of the corresponding warehouse
+  w_lat=subset(warehouse1_df,warehouse1_df$j==k)$Latitude
+  w_long=subset(warehouse1_df,warehouse1_df$j==k)$Longitude
+
+  #look at all customers assigned to this warehouse
+  df=subset(customer1_df,warehouse==k) 
+ 
+  xend=append(xend,df$lon) 
+  yend=append(yend,df$lat) 
+
+  x=append(x,rep(w_long,nrow(df))) 
+  y=append(y,rep(w_lat,nrow(df))) 
+
+  color=append(color,rep(k,nrow(df))) 
+} 
+
+segment_data = data.frame( 
+    x = x, 
+    y = y, 
+    xend = xend,  
+    yend = yend, 
+    color=color 
+) 
+
+library(ggarchery) 
+
+gg+
+  geom_segment(data = segment_data, aes(x = x, y = y, xend = xend, yend = yend,group=NA,color=as.factor(color)),arrow = arrow(length = unit(0.3, "picas"))) +   theme(legend.position = "none") +
+    coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+```
+
+### 4.3.2 External terminus to Parisian hubs
+
+Here we perform a grouping and join operation on the data to group the customer data by warehouse, then calculate the total demand for each warehouse by summing the number of packages. We join the demand data by warehouse with the warehouse data, so the code associates the total demand with each warehouse in warehouse1_df, adding a new "demand" column.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+library(dplyr)
+
+# Sum the demand for each warehouse
+demand_per_warehouse1 <- customer1_df %>%
+  group_by(warehouse) %>%
+  summarise(demand = sum(nb_parcelAll))
+
+# Join the demand_per_warehouse with the warehouse1_df
+warehouse1_df <- left_join(warehouse1_df, demand_per_warehouse1, by = c("j" = "warehouse"))
+
+```
+
+In the following code, we again set up our parameters for this optimization, which in this case aims to connect the termini and all the Paris hubs while minimizing the objective function. Then we launch the optimization process.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+terminus_df = metro_terminus_df
+stops_df = warehouse1_df
+stops_df <- filter(stops_df, chosen == 1)
+
+
+I = nrow(stops_df)
+J = nrow(terminus_df)
+
+stops_df$i = 1:I
+terminus_df$j = 1:J
+
+m = pointDistance(terminus_df[,c("Longitude","Latitude")],stops_df[,c("Longitude","Latitude")],lonlat=TRUE,allpairs=TRUE)
+m = m/1000  # Convert to km
+
+Cap = 6000  # Capacity of a metro train
+avg_speed = 25  # Average metro speed in km/h
+h = avg_speed/60  # Convert to km/min
+
+time_per_stop = 30/60  # Time to unload parcels at each stop in hours
+
+stops_df$nb_trips = ceiling(stops_df$demand / Cap)
+
+c = matrix(0,I,J)
+for(i in 1:I){
+  for(j in 1:J){
+      c[i,j] = (m[j,i] / h + stops_df[i,"nb_trips"] * time_per_stop) * 100  # Cost to deliver parcels from terminus j to stop i
+    }
+}
+
+f = 190  # Fixed cost per day
+terminus_df$fixed_cost = f
+d = stops_df$demand
+
+julia_assign("c", c)
+julia_assign("d", d)
+julia_assign("f", terminus_df$fixed_cost) 
+julia_assign("stops_df", stops_df)
+julia_assign("terminus_df", terminus_df)
+julia_assign("I", nrow(stops_df))
+julia_assign("J", nrow(terminus_df))
+
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+using JuMP
+using Gurobi
+
+# We use the same I and J from the R code
+II= [i for i in 1:I if stops_df[i,:demand]!=0]
+
+mod = Model(Gurobi.Optimizer)
+
+# Declaring variables
+@variable(mod, x[1:I,1:J], Bin)
+@variable(mod, y[1:J], Bin)
+
+# Setting the objective
+    @objective(mod, Min, sum(c[i,j] * x[i,j] for i in 1:I for j in 1:J) + sum(f[j] * y[j] for j in 1:J));
+
+#setting the constraints
+@constraint(mod, supply[i in 1:I, j in 1:J], x[i, j] <= y[j])
+@constraint(mod, demand[i in II], sum(x[i, j] for j in 1:J) == 1)
+
+# Solving the optimization problem
+optimize!(mod)
+
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+using DataFrames
+
+# Store solution
+terminus_df.chosen = zeros(J)
+stops_df.terminus = zeros(I)
+
+for j = 1:J
+    if JuMP.value(y[j]) == 1
+        terminus_df.chosen[j] = 1
+    end
+end
+for j = 1:J
+    for i = 1:I
+        if JuMP.value(x[i,j]) == 1
+            stops_df.terminus[i] = j
+        end
+    end
+end
+
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+objective_value(mod)
+```
+
+The cost of serving the optimal hubs from the terminus is 23,014.84.
+
+### 4.3.3 Optimal terminus location and assignments
+
+In order to obtain the most optimal network possible, it will also be necessary to find the best stations to be parcel delivery terminals. That's the aim of this part of the work.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+terminus_df=julia_eval("terminus_df") 
+stops_df=julia_eval("stops_df") 
+
+xend <- c() 
+yend <- c() 
+x <- c() 
+y <- c() 
+color <- c() 
+
+for(k in which(terminus_df$chosen == 1)){ 
+  # Store lat and long of the corresponding terminus
+  t_lat <- terminus_df$Latitude[terminus_df$j == k]
+  t_long <- terminus_df$Longitude[terminus_df$j == k]
+
+  # Look at all stops assigned to this terminus
+  df <- subset(stops_df, terminus == k)
+ 
+  xend <- append(xend, df$Longitude) 
+  yend <- append(yend, df$Latitude) 
+
+  x <- append(x, rep(t_long, nrow(df))) 
+  y <- append(y, rep(t_lat, nrow(df))) 
+
+  color <- append(color, rep(k, nrow(df))) 
+} 
+
+segment_data1 <- data.frame( 
+    x = x, 
+    y = y, 
+    xend = xend,  
+    yend = yend, 
+    color = color
+) 
+
+
+
+gg+
+  geom_segment(data = segment_data1, aes(x = x, y = y, xend = xend, yend = yend,group=NA,color=as.factor(color)),arrow = arrow(length = unit(0.3, "picas"))) +   theme(legend.position = "none") +
+    coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+```
+
+### 4.3.4 External warehouses to terminus
+
+In order to link our Paris network to the main French warehouses in the best possible way, it is important to optimize this stage of parcel transport too.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+# Sum the demand for each terminus
+demand_per_terminus <- stops_df %>%
+  group_by(terminus) %>%
+  summarise(demand2 = sum(demand))
+
+# Join the demand_per_terminus with the terminus_df
+terminus_df <- left_join(terminus_df, demand_per_terminus, by = c("j" = "terminus"))
+```
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+ 
+ customer_df=terminus_df
+customer_df <- filter(customer_df, chosen == 1)
+ warehouse_df=Entrepots
+#customer_df <- customer_df[, -21] #ligne possiblement a enlever
+warehouse_df <- warehouse_df[-3, ] #enlever le warehouse au milieu de paris
+
+ I=nrow(customer_df)
+ J=nrow(warehouse_df)
+
+ customer_df$i=1:I
+ warehouse_df$j=1:J
+ 
+m=pointDistance(warehouse_df[,c("Long","Lat")],customer_df[,c("Longitude","Latitude")],lonlat=TRUE,allpairs=TRUE)
+# we convert to km
+m=m/1000
+#we add a detour coefficient in the city
+m=m*1.3
+
+#we can compute the cost of assigning zone i to warehouse j (we reason at the daily level)
+#Capacity of a van
+Cap=120
+#hourly cost
+h=27 #euros per hour
+
+#speed
+lh_s=25 #line haul speed in km/h
+de_s=11 #delivery speed in km/h
+tps= 5/60 #5 minutes per stop
+
+paris_area_sqkm <- 105.4
+customer_df$tour_length <- sqrt(customer_df$demand2 * paris_area_sqkm) * 1.9
+customer_df$nb_tours=ceiling(customer_df$demand2/Cap)
+#Pour transformer la variable area_sqkm en une constante pour Paris, vous pouvez utiliser la valeur de la superficie de Paris en kilomètres carrés. Selon les données disponibles, la superficie de Paris est d'environ 105,4 kilomètres carrés.
+c=matrix(0,I,J)
+for(i in 1:I){
+  for(j in 1:J){
+      c[i,j]=(customer_df[i,"tour_length"]/de_s + customer_df[i,"nb_tours"]*2*m[j,i]/lh_s + customer_df[i,"demand2"]*tps)*h
+      #c[i,j]=(customer_df[i,"nb_tours"]*2*m[j,i]/lh_s)*h
+      #c[i,j]=(ceiling(customer_df[i,"nb_tours"])*2*m[j,i]/lh_s)*h
+    }
+}
+
+d=customer_df$demand2
+
+julia_assign("c", c)
+julia_assign("d", d)
+julia_assign("customer_df", customer_df)
+julia_assign("warehouse_df", warehouse_df)
+julia_assign("I", nrow(customer_df))
+julia_assign("J", nrow(warehouse_df))
+
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+using JuMP
+using Gurobi
+
+II = [i for i in 1:I if !ismissing(customer_df[i,:demand2]) && customer_df[i,:demand2] != 0]
+
+
+mod = Model(Gurobi.Optimizer)
+
+# Declaring variables
+@variable(mod, x[1:I, 1:J], Bin)
+@variable(mod, y[1:J], Bin)
+
+# Setting the objective
+@objective(mod, Min, sum(c[i, j] * x[i, j] for i in 1:I for j in 1:J))
+
+# Setting the constraints
+@constraint(mod, supply[i in 1:I, j in 1:J], x[i, j] <= y[j])
+@constraint(mod, demand[i in II], sum(x[i, j] for j in 1:J) == 1)
+
+# Solving the optimization problem
+optimize!(mod)
+
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+using DataFrames
+
+       
+    #store solution
+warehouse_df.chosen=zeros(J);
+customer_df.warehouse=zeros(I);
+
+for j=1:J
+       if(JuMP.value(y[j])==1)
+          warehouse_df.chosen[j]=1;
+        end
+     end
+     for j=1:J
+        for i=1:I
+           if(JuMP.value(x[i,j])==1)
+             customer_df.warehouse[i]=j;
+           end
+        end
+     end
+```
+
+```{julia,echo=TRUE,message=FALSE,warning=FALSE}
+objective_value(mod)
+```
+
+The cost of serving the optimal terminus from the warehouses of the three branches is 2,118,447.56.
+
+### 4.3.5 Optimal warehouses location and assignments
+
+We can then define the optimum position of the warehouses to improve the parcel delivery process.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE,results='hide'}
+warehouse_df=julia_eval("warehouse_df") 
+customer_df=julia_eval("customer_df") 
+
+xend=vector() 
+yend=vector() 
+x=vector() 
+y=vector() 
+color=vector() 
+
+for(k in which(warehouse_df$chosen==1)){ 
+  #store lat and long of the corresponding warehouse
+  w_lat=subset(warehouse_df,warehouse_df$j==k)$Lat
+  w_long=subset(warehouse_df,warehouse_df$j==k)$Long
+
+  #look at all customers assigned to this warehouse
+  df=subset(customer_df,warehouse==k) 
+ 
+  xend=append(xend,df$Longitude) 
+  yend=append(yend,df$Latitude) 
+
+  x=append(x,rep(w_long,nrow(df))) 
+  y=append(y,rep(w_lat,nrow(df))) 
+
+  color=append(color,rep(k,nrow(df))) 
+} 
+
+segment_data2 = data.frame( 
+    x = x, 
+    y = y, 
+    xend = xend,  
+    yend = yend, 
+    color=color 
+) 
+
+library(ggarchery) 
+
+gg+
+  geom_segment(data = segment_data2, aes(x = x, y = y, xend = xend, yend = yend,group=NA,color=as.factor(color)),arrow = arrow(length = unit(0.3, "picas"))) +   theme(legend.position = "none") +
+    coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+```
+
+## 4.4 Graphic representation of the terminus and warehouses for our presentation
+
+This is the final representation of the results obtained.
+
+```{r,echo=TRUE,message=FALSE,warning=FALSE}
+# Combine segment_data1 and segment_data2
+combined_data <- rbind(segment_data1, segment_data2)
+
+# Plot
+
+gg+
+  geom_segment(data = combined_data, aes(x = x, y = y, xend = xend, yend = yend,group=NA,color=as.factor(color)),arrow = arrow(length = unit(0.3, "picas"))) +   theme(legend.position = "none") +
+    coord_quickmap(xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+```
+
+## 4.5 Conclusion on the use of the metro system.
+
+The total cost of using the metro system to deliver parcels in Paris is 1,090,296.51 + 23,014.84 + 2,118,447.56 = 3,231,758.91.
+
+It is currently significantly more expensive than the current way of delivering parcels, nonetheless we believe this can be improve greatly and could result in a faster, greener and more efficient way of delivering parcels in Paris.
+
+## 4.6 What's next ?
+
+We realised that the cost of implementing our idea was very high. However, we've already thought of a few ways of reducing costs.
+
+Set up lockers at each micro-hub so that customers can collect their parcels themselves.
+
+Establishing a relationship between RATP and La Poste to reduce the costs of micro-hubs, for example.
+
+Increase delivery costs.
+
+La Poste could also close unnecessary warehouses, according to our optimization.
+
+All these ways would reduce costs for La Poste.
+
+# 5. Conclusion
+
+To conclude this supply chain project focused on the implementation and optimization of a supply chain network for parcel deliveries for La Poste Group in Paris we can see that our team used a variety of tools and techniques to develop a solution tailored to the observed problem we faced: optimizing parcel delivery in a city as important as Paris.
+
+We began this project by observing the initial situation, analyzing the demand for parcels in Paris and selecting potential warehouse locations. Using optimization models, an optimal solution was found, minimizing delivery costs and taking into account constraints such as vehicle capacity, running costs and delivery times.
+
+Next, an analysis was carried out for several branches of La Poste group, namely DPD, Chronopost and Colissimo. As with the general analysis, costs were assessed and optimization were made to improve the distribution network and reduce overall costs for each of these subsidiaries.
+
+We then decided to add an innovative dimension to our project by proposing the use of the Paris metro network for parcel distribution. Although the current costs of this method are still high, it is suggested that improvements could be made to make this approach faster, more sustainable and more efficient in the future. We are confident that this solution will lead to an overall improvement in the parcel delivery process in the Paris region. Furthermore, we believe that with the recent work to optimize metro transport in Paris following the arrival of the Olympic Games in 2024, it would be possible to incorporate the work needed to set up this metro delivery system at the same time.
+
+In the end, the total optimized cost of the supply chain, including by the use of the metro for delivery is 3,231,758.91€ daily. This project highlighted the potential for optimizing La Poste's supply chain in Paris, providing suggestions for improving operational efficiency, reducing costs and exploring new and innovative delivery methods.
