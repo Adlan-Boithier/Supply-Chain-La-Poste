@@ -15,7 +15,7 @@ This project was done in collaboration with La Poste group to optimize their cur
 
 - Use trains to transport parcels to Paris from warehouses located outside Paris rather than using trucks.
 - Use approprite train/metro stations inside of Paris as micro hubs.
-- Partner with the RATP to allow some metro carriages to be used solely for parcels transportation. It is estimated that 6'OOO parcels could be transported by one metro.
+- Partner with the RATP to allow some metro carriages to be used solely for parcels transportation. It is estimated that 6'000 parcels could be transported by one metro.
 
 ## **Limits and potential solutions:**
 Costs for this option are too high at the moment but several options to reduce them are possible, such as:
